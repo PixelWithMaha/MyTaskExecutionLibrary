@@ -66,6 +66,8 @@ class YourTask : public IRunnable {
         ~YourTask() {}
         void runTask(int task_id, int num_total_tasks) {}
 };
+
+
 /*
  * Implement your test here. Call this function from a wrapper that passes in
  * do_async and num_elements. See `simpleTest`, `simpleTestSync`, and
@@ -1402,4 +1404,302 @@ TestResults strictGraphDepsMedium(ITaskSystem* t) {
 
 TestResults strictGraphDepsLarge(ITaskSystem* t) {
     return strictGraphDepsTestBase(t,1000,20000,0);
+}
+/*
+- ==================================================================
+-   Part C: Custom Test Definitions & Tasks
+- ==================================================================
+*/
+
+class CustomEdgeCaseTask : public IRunnable {
+public:
+    std::atomic<int>* task_counts_;
+    std::atomic<int>* launch_num_tasks_;
+    std::atomic<int>* global_counter_;
+    std::vector<int>* start_stamps_;
+    std::vector<int>* finish_stamps_;
+    int launch_offset_;
+
+    CustomEdgeCaseTask(std::atomic<int>* counts, std::atomic<int>* num_tasks, 
+                       std::atomic<int>* g_counter, std::vector<int>* starts, 
+                       std::vector<int>* finishes, int offset = 0)
+        : task_counts_(counts), launch_num_tasks_(num_tasks), 
+          global_counter_(g_counter), start_stamps_(starts), 
+          finish_stamps_(finishes), launch_offset_(offset) {}
+
+    void runTask(int task_id, int num_total_tasks) override {
+        int idx = launch_offset_ + task_id;
+        task_counts_[idx].fetch_add(1);
+        launch_num_tasks_[idx].store(num_total_tasks);
+
+        if (global_counter_ && start_stamps_ && finish_stamps_) {
+            (*start_stamps_)[idx] = global_counter_->fetch_add(1);
+            for (volatile int i = 0; i < 50; ++i) {}
+            (*finish_stamps_)[idx] = global_counter_->fetch_add(1);
+        }
+    }
+};
+
+inline TestResults customEdgeCasesTestImpl(ITaskSystem* t, bool do_async) {
+    TestResults results;
+    results.passed = true;
+
+    double start_time = CycleTimer::currentSeconds();
+
+    const int CHEAP_TASKS = 1000; // Scaled to maintain high frequency under serial
+    const int LOOP_LAUNCHES = 100;
+    int total_slots = 1 + 3 + CHEAP_TASKS + (LOOP_LAUNCHES * 2) + 2 + 2;
+
+    std::vector<std::atomic<int>> task_counts(total_slots);
+    std::vector<std::atomic<int>> launch_num_tasks(total_slots);
+    for (int i = 0; i < total_slots; ++i) {
+        task_counts[i].store(0);
+        launch_num_tasks[i].store(0);
+    }
+
+    std::atomic<int> global_counter(0);
+    std::vector<int> start_stamps(total_slots, 0);
+    std::vector<int> finish_stamps(total_slots, 0);
+
+    if (!do_async) {
+        int offset = 0;
+        
+        CustomEdgeCaseTask task1(task_counts.data(), launch_num_tasks.data(), nullptr, nullptr, nullptr, offset);
+        t->run(&task1, 1);
+        offset += 1;
+
+        CustomEdgeCaseTask task2(task_counts.data(), launch_num_tasks.data(), nullptr, nullptr, nullptr, offset);
+        t->run(&task2, 3);
+        offset += 3;
+
+        CustomEdgeCaseTask task3(task_counts.data(), launch_num_tasks.data(), nullptr, nullptr, nullptr, offset);
+        t->run(&task3, CHEAP_TASKS);
+        offset += CHEAP_TASKS;
+
+        for (int i = 0; i < LOOP_LAUNCHES; ++i) {
+            CustomEdgeCaseTask task_loop(task_counts.data(), launch_num_tasks.data(), nullptr, nullptr, nullptr, offset);
+            t->run(&task_loop, 2);
+            offset += 2;
+        }
+
+        CustomEdgeCaseTask task_dup(task_counts.data(), launch_num_tasks.data(), nullptr, nullptr, nullptr, offset);
+        t->run(&task_dup, 2);
+        offset += 2;
+
+        CustomEdgeCaseTask task_completed_dep(task_counts.data(), launch_num_tasks.data(), nullptr, nullptr, nullptr, offset);
+        t->run(&task_completed_dep, 2);
+
+        t->sync();
+        t->sync();
+
+    } else {
+        std::vector<TaskID> no_deps;
+
+        CustomEdgeCaseTask task1(task_counts.data(), launch_num_tasks.data(), &global_counter, &start_stamps, &finish_stamps, 0);
+        TaskID id1 = t->runAsyncWithDeps(&task1, 1, no_deps);
+
+        CustomEdgeCaseTask task2(task_counts.data(), launch_num_tasks.data(), &global_counter, &start_stamps, &finish_stamps, 1);
+        TaskID id2 = t->runAsyncWithDeps(&task2, 3, {id1});
+
+        CustomEdgeCaseTask task3(task_counts.data(), launch_num_tasks.data(), nullptr, nullptr, nullptr, 4);
+        TaskID id3 = t->runAsyncWithDeps(&task3, CHEAP_TASKS, {id2});
+
+        TaskID prev_id = id3;
+        int offset = 4 + CHEAP_TASKS;
+        for (int i = 0; i < LOOP_LAUNCHES; ++i) {
+            CustomEdgeCaseTask task_loop(task_counts.data(), launch_num_tasks.data(), nullptr, nullptr, nullptr, offset);
+            prev_id = t->runAsyncWithDeps(&task_loop, 2, {prev_id});
+            offset += 2;
+        }
+
+        CustomEdgeCaseTask task_dup(task_counts.data(), launch_num_tasks.data(), nullptr, nullptr, nullptr, offset);
+        TaskID id_dup = t->runAsyncWithDeps(&task_dup, 2, {prev_id, prev_id, prev_id});
+        offset += 2;
+
+        t->sync();
+        t->sync();
+
+        CustomEdgeCaseTask task_completed_dep(task_counts.data(), launch_num_tasks.data(), nullptr, nullptr, nullptr, offset);
+        t->runAsyncWithDeps(&task_completed_dep, 2, {id_dup});
+        
+        t->sync();
+    }
+
+    double end_time = CycleTimer::currentSeconds();
+    results.time = end_time - start_time;
+
+    for (int i = 0; i < total_slots; ++i) {
+        if (task_counts[i].load() != 1) {
+            results.passed = false;
+            printf("Slot %d ran %d times expected=1\n", i, task_counts[i].load());
+            return results;
+        }
+    }
+
+    if (do_async) {
+        int id1_max_finish = finish_stamps[0];
+        for (int i = 1; i <= 3; ++i) {
+            if (start_stamps[i] < id1_max_finish) {
+                results.passed = false;
+                printf("Task in id2 started before parent id1 finished!\n");
+                return results;
+            }
+        }
+    }
+
+    return results;
+}
+
+inline TestResults customEdgeCasesTest(ITaskSystem* t) {
+    return customEdgeCasesTestImpl(t, false);
+}
+
+inline TestResults customEdgeCasesAsyncTest(ITaskSystem* t) {
+    return customEdgeCasesTestImpl(t, true);
+}
+
+class CustomSkewedTask : public IRunnable {
+public:
+    int N_;
+    std::vector<double>* output_;
+
+    CustomSkewedTask(int n_tasks, std::vector<double>* out) 
+        : N_(n_tasks), output_(out) {}
+
+    void runTask(int task_id, int num_total_tasks) override {
+        int iterations = 1000;
+        if (task_id < static_cast<int>(N_ * 0.05)) {
+            iterations = 50000;
+        }
+
+        double val = static_cast<double>(task_id);
+        for (int i = 0; i < iterations; ++i) {
+            val = sin(val) + cos(val);
+        }
+        (*output_)[task_id] = val;
+    }
+};
+
+inline TestResults customSkewedCostTest(ITaskSystem* t) {
+    TestResults results;
+    results.passed = true;
+
+    const int N = 512;
+    std::vector<double> output(N, 0.0);
+
+    double start_time = CycleTimer::currentSeconds();
+
+    CustomSkewedTask task(N, &output);
+    t->run(&task, N);
+
+    double end_time = CycleTimer::currentSeconds();
+    results.time = end_time - start_time;
+
+    for (int i = 0; i < N; ++i) {
+        if (std::isnan(output[i]) || output[i] == 0.0) {
+            results.passed = false;
+            printf("Invalid output at task_id %d\n", i);
+            return results;
+        }
+    }
+
+    return results;
+}
+
+class CustomChainTask : public IRunnable {
+public:
+    std::vector<double>* data_;
+    int launch_idx_;
+
+    CustomChainTask(std::vector<double>* d, int idx) : data_(d), launch_idx_(idx) {}
+
+    void runTask(int task_id, int num_total_tasks) override {
+        double val = (*data_)[launch_idx_ * 2 + task_id];
+        for (int i = 0; i < 20000; ++i) {
+            val = sin(val) * cos(val) + 1.0;
+        }
+        (*data_)[launch_idx_ * 2 + task_id] = val;
+    }
+};
+
+class CustomJoinTask : public IRunnable {
+public:
+    std::vector<double>* data_;
+    double* final_sum_;
+
+    CustomJoinTask(std::vector<double>* d, double* sum) : data_(d), final_sum_(sum) {}
+
+    void runTask(int task_id, int num_total_tasks) override {
+        double total = 0.0;
+        for (double val : *data_) {
+            total += val;
+        }
+        *final_sum_ = total;
+    }
+};
+
+inline TestResults customParallelChainsTestImpl(ITaskSystem* t, bool do_async) {
+    TestResults results;
+    results.passed = true;
+
+    const int K = 8;
+    const int M = 10;
+    const int TASKS_PER_LAUNCH = 2;
+
+    std::vector<double> data(K * M * TASKS_PER_LAUNCH, 1.5);
+    double final_sum = 0.0;
+
+    double start_time = CycleTimer::currentSeconds();
+
+    if (!do_async) {
+        for (int k = 0; k < K; ++k) {
+            for (int m = 0; m < M; ++m) {
+                int launch_idx = k * M + m;
+                CustomChainTask task(&data, launch_idx);
+                t->run(&task, TASKS_PER_LAUNCH);
+            }
+        }
+        CustomJoinTask join(&data, &final_sum);
+        t->run(&join, 1);
+    } else {
+        std::vector<TaskID> last_launch_ids;
+
+        for (int k = 0; k < K; ++k) {
+            TaskID prev_id = -1;
+            for (int m = 0; m < M; ++m) {
+                int launch_idx = k * M + m;
+                CustomChainTask task(&data, launch_idx);
+
+                std::vector<TaskID> deps;
+                if (m > 0) {
+                    deps.push_back(prev_id);
+                }
+
+                prev_id = t->runAsyncWithDeps(&task, TASKS_PER_LAUNCH, deps);
+            }
+            last_launch_ids.push_back(prev_id);
+        }
+
+        CustomJoinTask join(&data, &final_sum);
+        t->runAsyncWithDeps(&join, 1, last_launch_ids);
+
+        t->sync();
+    }
+
+    double end_time = CycleTimer::currentSeconds();
+    results.time = end_time - start_time;
+
+    if (std::isnan(final_sum) || final_sum == 0.0) {
+        results.passed = false;
+    }
+
+    return results;
+}
+
+inline TestResults customParallelChainsTest(ITaskSystem* t) {
+    return customParallelChainsTestImpl(t, false);
+}
+
+inline TestResults customParallelChainsAsyncTest(ITaskSystem* t) {
+    return customParallelChainsTestImpl(t, true);
 }

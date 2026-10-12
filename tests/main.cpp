@@ -10,7 +10,6 @@
 #define DEFAULT_NUM_THREADS 8
 #define DEFAULT_NUM_TIMING_ITERATIONS 3
 
-
 void usage(const char* progname, std::string *testnames, int num_tests) {
     printf("Usage: %s [options] testname\n", progname);
     printf("Program Options:\n");
@@ -28,7 +27,7 @@ enum TaskSystemType {
     PARALLEL_SPAWN,
     PARALLEL_THREAD_POOL_SPINNING,
     PARALLEL_THREAD_POOL_SLEEPING,
-    N_TASKSYS_IMPLS, // This must be in the last position.
+    N_TASKSYS_IMPLS,
 };
 
 ITaskSystem *selectTaskSystemRefImpl(int num_threads, TaskSystemType type) {
@@ -49,7 +48,7 @@ ITaskSystem *selectTaskSystemRefImpl(int num_threads, TaskSystemType type) {
 
 int main(int argc, char** argv)
 {
-    const int n_tests = 31;
+    const int n_tests = 34;
     int num_threads = DEFAULT_NUM_THREADS;
     int num_timing_iterations = DEFAULT_NUM_TIMING_ITERATIONS;
 
@@ -83,6 +82,11 @@ int main(int argc, char** argv)
         strictGraphDepsSmall,
         strictGraphDepsMedium,
         strictGraphDepsLarge,
+        customEdgeCasesTest,
+        customEdgeCasesAsyncTest,
+        customSkewedCostTest,
+        customParallelChainsTest,
+        customParallelChainsAsyncTest
     };
 
     std::string test_names[n_tests] = {
@@ -115,9 +119,13 @@ int main(int argc, char** argv)
         "strict_graph_deps_small_async",
         "strict_graph_deps_med_async",
         "strict_graph_deps_large_async",
+        "custom_edge_cases",
+        "custom_edge_cases_async",
+        "custom_skewed_cost",
+        "custom_parallel_chains",
+        "custom_parallel_chains_async"
     };
- 
-    // Parse commandline options
+
     int opt;
     static struct option long_options[] = {
         {"num_threads",           1, 0,  'n'},
@@ -126,7 +134,6 @@ int main(int argc, char** argv)
     };
 
     while ((opt = getopt_long(argc, argv, "n:i:?", long_options, NULL)) != EOF) {
-
         switch (opt) {
         case 'n':
             num_threads = atoi(optarg);
@@ -166,13 +173,10 @@ int main(int argc, char** argv)
             double minT = 1e30;
             for (int j = 0; j < num_timing_iterations; j++) {
 
-                // Create a new task system
                 ITaskSystem *t = selectTaskSystemRefImpl(num_threads, (TaskSystemType) i);
 
-                // Run test
                 TestResults result = test[test_id](t);
 
-                // Check that the test result was correct
                 if (!result.passed) {
                     printf("ERROR: Results did not pass correctness check! (iter=%d, ref_impl=%s)\n",
                         j, t->name());
@@ -181,12 +185,10 @@ int main(int argc, char** argv)
 
                 minT = std::min(minT, result.time);
 
-                // TODO: do this better
                 if( j+1 == num_timing_iterations) {
                     printf("[%s]:\t\t[%.3f] ms\n", t->name(), minT * 1000);
                 }
 
-                // Shutdown task system so each timing run is from a clean start
                 delete t;
             }
         }
