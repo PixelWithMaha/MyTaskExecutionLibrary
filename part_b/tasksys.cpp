@@ -109,79 +109,91 @@ const char* TaskSystemParallelThreadPoolSleeping::name() {
 }
 
 TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads)
-    : ITaskSystem(num_threads), num_threads_(num_threads), stop_(false), next_launch_id_(0), active_tasks_count_(0) {
-    for (int i = 0; i < num_threads_; ++i) {
-        workers_.emplace_back(&TaskSystemParallelThreadPoolSleeping::workerThread, this);
+    : ITaskSystem(num_threads) {
+    for (int i = 0; i < num_threads; ++i) {
+        workers.emplace_back(&TaskSystemParallelThreadPoolSleeping::workerThreadLoop, this);
     }
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     {
-        std::unique_lock<std::mutex> lock(mutex_);
-        stop_ = true;
+        std::lock_guard<std::mutex> lock(mutex_);
+        shutdown = true;
     }
     cv_worker_.notify_all();
-    for (std::thread &worker : workers_) {
+    for (std::thread &worker : workers) {
         if (worker.joinable()) {
             worker.join();
         }
     }
 }
 
-void TaskSystemParallelThreadPoolSleeping::workerThread() {
-    while (true) {
-        Launch* launch = nullptr;
-        int task_id = -1;
+void TaskSystemParallelThreadPoolSleeping::workerThreadLoop() {
+   while (true) {
+        TaskLaunch* current_launch = nullptr;
+        int task_id_to_run = -1;
 
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_worker_.wait(lock, [this]() {
-                return stop_ || !ready_queue_.empty();
-            });
 
-            if (stop_ && ready_queue_.empty()) {
-                return;
+            while (!shutdown) {
+         
+                while (!ready_queue.empty()) {
+                    TaskLaunch* candidate = ready_queue.front();
+                    int task_idx = candidate->next_task_idx.fetch_add(1);
+
+                    if (task_idx < candidate->num_total_tasks) {
+                        current_launch = candidate;
+                        task_id_to_run = task_idx;
+                        break;
+                    } else {
+                        
+                        ready_queue.pop();
+                    }
+                }
+
+                if (current_launch != nullptr) {
+                    break; 
+                }
+
+                cv_worker_.wait(lock);
             }
 
-            launch = ready_queue_.front();
-            task_id = launch->next_task_index++;
-
-            if (launch->next_task_index == launch->num_total_tasks) {
-                ready_queue_.pop();
+            if (shutdown && current_launch == nullptr) {
+                return;
             }
         }
 
-        // Execute task strictly outside the lock
-        launch->runnable->runTask(task_id, launch->num_total_tasks);
+        current_launch->runnable->runTask(task_id_to_run, current_launch->num_total_tasks);
 
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            launch->remaining_tasks--;
-            active_tasks_count_--;
+        int finished_tasks = current_launch->tasks_completed.fetch_add(1) + 1;
 
-            if (launch->remaining_tasks == 0) {
-                TaskID completed_id = launch->id;
-                completed_launches_.insert(completed_id);
+        if (finished_tasks == current_launch->num_total_tasks) {
+            std::lock_guard<std::mutex> lock(mutex_);
 
-                if (dependents_.count(completed_id)) {
-                    for (TaskID dep_launch_id : dependents_[completed_id]) {
-                        Launch* dep_launch = launches_[dep_launch_id];
-                        dep_launch->unfinished_deps--;
+            TaskID finished_id = current_launch->launch_id;
+            completed_launches.insert(finished_id);
 
-                        if (dep_launch->unfinished_deps == 0) {
-                            ready_queue_.push(dep_launch);
-                            cv_worker_.notify_all();
-                        }
+            for (TaskID dep_id : current_launch->dependents) {
+                auto it = all_launches.find(dep_id);
+                if (it != all_launches.end()) {
+                    TaskLaunch* dep_launch = it->second;
+                    dep_launch->remaining_deps--;
+
+                    if (dep_launch->remaining_deps == 0) {
+                        ready_queue.push(dep_launch);
+                        cv_worker_.notify_all();
                     }
-                    dependents_.erase(completed_id);
                 }
+            }
 
-                delete launch;
-                launches_.erase(completed_id);
+            all_launches.erase(finished_id);
+            delete current_launch;
 
-                if (active_tasks_count_ == 0 && ready_queue_.empty()) {
-                    cv_sync_.notify_all();
-                }
+            total_active_launches--;
+
+            if (total_active_launches == 0) {
+                cv_sync_.notify_all();
             }
         }
     }
@@ -189,32 +201,29 @@ void TaskSystemParallelThreadPoolSleeping::workerThread() {
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(
     IRunnable* runnable, int num_total_tasks, const std::vector<TaskID>& deps) {
+    
+        std::lock_guard<std::mutex> lock(mutex_);
 
-    std::unique_lock<std::mutex> lock(mutex_);
-
-    TaskID launch_id = next_launch_id_++;
-    Launch* launch = new Launch();
-    launch->id = launch_id;
+    TaskID launch_id = next_launch_id++;
+    TaskLaunch* launch = new TaskLaunch();
+    launch->launch_id = launch_id;
     launch->runnable = runnable;
     launch->num_total_tasks = num_total_tasks;
-    launch->next_task_index = 0;
-    launch->remaining_tasks = num_total_tasks;
-    launch->unfinished_deps = 0;
 
-    launches_[launch_id] = launch;
-
-    std::unordered_set<TaskID> unique_deps(deps.begin(), deps.end());
-    for (TaskID dep_id : unique_deps) {
-        if (completed_launches_.find(dep_id) == completed_launches_.end()) {
-            launch->unfinished_deps++;
-            dependents_[dep_id].push_back(launch_id);
+    int unfinished_deps = 0;
+    for (TaskID dep : deps) {
+        if (completed_launches.find(dep) == completed_launches.end()) {
+            unfinished_deps++;
+            all_launches[dep]->dependents.push_back(launch_id);
         }
     }
 
-    active_tasks_count_ += num_total_tasks;
+    launch->remaining_deps = unfinished_deps;
+    all_launches[launch_id] = launch;
+    total_active_launches++;
 
-    if (launch->unfinished_deps == 0) {
-        ready_queue_.push(launch);
+    if (unfinished_deps == 0) {
+        ready_queue.push(launch);
         cv_worker_.notify_all();
     }
 
@@ -222,13 +231,14 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(
 }
 
 void TaskSystemParallelThreadPoolSleeping::sync() {
-    std::unique_lock<std::mutex> lock(mutex_);
+   std::unique_lock<std::mutex> lock(mutex_);
     cv_sync_.wait(lock, [this]() {
-        return active_tasks_count_ == 0 && ready_queue_.empty();
+        return total_active_launches == 0;
     });
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
-    runAsyncWithDeps(runnable, num_total_tasks, {});
+    std::vector<TaskID> no_deps;
+    runAsyncWithDeps(runnable, num_total_tasks, no_deps);
     sync();
 }
