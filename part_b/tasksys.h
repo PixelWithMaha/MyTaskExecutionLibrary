@@ -9,6 +9,9 @@
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
+#include <atomic>
+
+
 
 class TaskSystemSerial: public ITaskSystem {
     public:
@@ -38,8 +41,7 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
         ~TaskSystemParallelThreadPoolSpinning();
         const char* name();
         void run(IRunnable* runnable, int num_total_tasks);
-        TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
-                                const std::vector<TaskID>& deps);
+        TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,const std::vector<TaskID>& deps);
         void sync();
 };
 
@@ -49,37 +51,38 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         ~TaskSystemParallelThreadPoolSleeping();
         const char* name();
         void run(IRunnable* runnable, int num_total_tasks);
-        TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
-                                const std::vector<TaskID>& deps);
+        TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks, const std::vector<TaskID>& deps);
         void sync();
 
     private:
-        struct Launch {
-            TaskID id;
-            IRunnable* runnable;
-            int num_total_tasks;
-            int next_task_index{0};
-            int remaining_tasks{0};
-            int unfinished_deps{0};
-        };
+       struct TaskLaunch {
+        TaskID launch_id;
+        IRunnable* runnable;
+        int num_total_tasks;
+        std::atomic<int> next_task_idx{0};
+        std::atomic<int> tasks_completed{0};
+        
+        int remaining_deps{0};
+        std::vector<TaskID> dependents; 
+    };
+    
+    void workerThreadLoop();
+       
+        std::vector<std::thread> workers;
+        bool shutdown{false};
 
-        int num_threads_;
-        std::vector<std::thread> workers_;
-        bool stop_;
+    std::mutex mutex_;
+    std::condition_variable cv_worker_; 
+    std::condition_variable cv_sync_;   
 
-        std::mutex mutex_;
-        std::condition_variable cv_worker_;
-        std::condition_variable cv_sync_;
+    TaskID next_launch_id{0};
+    int total_active_launches{0};      
 
-        TaskID next_launch_id_;
-        std::unordered_map<TaskID, Launch*> launches_;
-        std::unordered_set<TaskID> completed_launches_;
-        std::unordered_map<TaskID, std::vector<TaskID>> dependents_;
+    std::queue<TaskLaunch*> ready_queue;
+    std::unordered_map<TaskID, TaskLaunch*> all_launches;
+    std::unordered_set<TaskID> completed_launches;
+        
 
-        std::queue<Launch*> ready_queue_;
-        int active_tasks_count_;
-
-        void workerThread();
 };
 
 #endif
