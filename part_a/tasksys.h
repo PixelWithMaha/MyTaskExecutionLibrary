@@ -2,6 +2,11 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -34,6 +39,8 @@ class TaskSystemParallelSpawn: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+    private:
+        int num_threads_;
 };
 
 /*
@@ -51,6 +58,15 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+    private:
+        void workerLoop();
+        std::vector<std::thread> workers_;
+        std::mutex mtx_;
+        IRunnable* runnable_;
+        std::atomic<int> total_;
+        std::atomic<int> next_;
+        std::atomic<int> done_;
+        std::atomic<bool> stop_;
 };
 
 /*
@@ -68,6 +84,21 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+    private:
+        void workerLoop(int tid);
+        int nthreads_;
+        std::vector<std::thread> workers_;
+        std::mutex mtx_;
+        std::condition_variable work_cv_;
+        std::condition_variable done_cv_;
+        IRunnable* runnable_;
+        int total_;
+        int next_;
+        int done_;
+        bool stop_;
+        long long gen_;
+        int finished_workers_;
+        std::vector<long long> busy_ns_;
 };
 
 #endif
